@@ -1,0 +1,78 @@
+#!/usr/bin/env python
+
+import os
+import subprocess
+import sys
+import time
+
+from stat import ST_MTIME
+
+VERIFY = '/usr/local/bin/google-authenticator-verify'
+
+# number of seconds that a verification should be valid for
+# this is set to be valid for 9 hours
+VERIFICATION_VALIDITY_WINDOW = 3600*9
+
+# use the file's mod time to determine the last time verification was done.
+VERIFIED_TIME_DIR = os.path.expanduser('~/.google-ssh-key-last-verified')
+
+if not os.path.exists(VERIFIED_TIME_DIR):
+    os.makedirs(VERIFIED_TIME_DIR)
+
+def get_verified_time_file():
+    remote_ip = os.environ.get('SSH_CONNECTION', '').split(' ', 1)[0]
+
+    return os.path.join(VERIFIED_TIME_DIR, remote_ip)
+
+def is_ip_verified():
+    verified_time_file = get_verified_time_file()
+
+    if not os.path.exists(verified_time_file):
+        return False
+
+    now = time.time()
+    mtime = os.stat(verified_time_file)[ST_MTIME]
+
+    return now < (mtime + VERIFICATION_VALIDITY_WINDOW)
+
+def is_secret_correct(secret):
+    return subprocess.Popen([VERIFY, secret]).wait() == 0
+
+def launch_command():
+    command = os.environ.get('SSH_ORIGINAL_COMMAND')
+    if not command:
+        command = os.environ['SHELL']
+        args = (command, '-l')
+    else:
+        args = command.split()
+        command = args[0]
+
+    os.execvpe(command, args, os.environ)
+
+def save_verified_time():
+    verified_time_file = get_verified_time_file()
+
+    with open(verified_time_file, 'a'):
+        now = int(time.time())
+        os.utime(verified_time_file, (now, now))
+
+def main():
+    if is_ip_verified():
+        launch_command()
+
+    sys.stdout.write('secret: ')
+    sys.stdout.flush()
+
+    secret = sys.stdin.readline().strip()
+
+    if is_secret_correct(secret):
+        save_verified_time()
+        launch_command()
+
+    return 1
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        pass
