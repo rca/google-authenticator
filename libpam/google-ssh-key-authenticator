@@ -7,6 +7,11 @@ import time
 
 from stat import ST_MTIME
 
+# the file that holds user-specific configuration for authentication.  if this
+# file doesn't exist the user is not using 2-factor auth and should be allowed
+# to login anyway.
+AUTHENTICATOR_FILE = os.path.expanduser('~/.google_authenticator')
+
 VERIFY = '/usr/local/bin/google-authenticator-verify'
 
 # number of seconds that a verification should be valid for
@@ -47,6 +52,7 @@ def launch_command():
         args = command.split()
         command = args[0]
 
+    # replace the existing process with the original command.
     os.execvpe(command, args, os.environ)
 
 def save_verified_time():
@@ -58,6 +64,9 @@ def save_verified_time():
 
 def main():
     if is_ip_verified():
+        launch_command()
+
+    if not os.path.exists(AUTHENTICATOR_FILE):
         launch_command()
 
     sys.stdout.write('secret: ')
