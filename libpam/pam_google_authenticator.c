@@ -54,19 +54,28 @@
 #include "hmac.h"
 #include "sha1.h"
 
-#define MODULE_NAME "pam_google_authenticator"
-#define SECRET      "~/.google_authenticator"
+#include "libgoogleauthenticator.h"
 
-typedef struct Params {
-  const char *secret_filename_spec;
-  enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
-  int        noskewadj;
-  int        echocode;
-  int        fixed_uid;
-  uid_t      uid;
-  enum { PROMPT = 0, TRY_FIRST_PASS, USE_FIRST_PASS } pass_mode;
-  int        forward_pass;
-} Params;
+#define MODULE_NAME "pam_google_authenticator"
+
+typedef void (*log_wrapper)(pam_handle_t *pamh);
+
+static void log_message(int priority, pam_handle_t *pamh, const char *format, va_list args);
+
+logger pam_logger_wrapper(pam_handle_t *pamh) {
+    int pam_logger(int level, char *format, ...) {
+        va_list args;
+        va_start(args, format);
+
+        log_message(level, pamh, format, args);
+
+        va_end(args);
+
+        return 0;
+    }
+
+    return &pam_logger;
+}
 
 static char oom;
 
@@ -80,7 +89,7 @@ const char *get_error_msg(void) {
 #endif
 
 static void log_message(int priority, pam_handle_t *pamh,
-                        const char *format, ...) {
+                        const char *format, va_list args) {
   char *service = NULL;
   if (pamh)
     pam_get_item(pamh, PAM_SERVICE, (void *)&service);
@@ -90,8 +99,6 @@ static void log_message(int priority, pam_handle_t *pamh,
   char logname[80];
   snprintf(logname, sizeof(logname), "%s(" MODULE_NAME ")", service);
 
-  va_list args;
-  va_start(args, format);
 #if !defined(DEMO) && !defined(TESTING)
   openlog(logname, LOG_CONS | LOG_PID, LOG_AUTHPRIV);
   vsyslog(priority, format, args);
@@ -101,8 +108,6 @@ static void log_message(int priority, pam_handle_t *pamh,
     vsnprintf(error_msg, sizeof(error_msg), format, args);
   }
 #endif
-
-  va_end(args);
 
   if (priority == LOG_EMERG) {
     // Something really bad happened. There is no way we can proceed safely.
@@ -121,106 +126,15 @@ static int converse(pam_handle_t *pamh, int nargs,
   return conv->conv(nargs, message, response, conv->appdata_ptr);
 }
 
-static const char *get_user_name(pam_handle_t *pamh) {
+static const char *get_user_name(logger *log, pam_handle_t *pamh) {
   // Obtain the user's name
   const char *username;
   if (pam_get_item(pamh, PAM_USER, (void *)&username) != PAM_SUCCESS ||
       !username || !*username) {
-    log_message(LOG_ERR, pamh,
-                "No user name available when checking verification code");
+    (*log)(LOG_ERR, "No user name available when checking verification code");
     return NULL;
   }
   return username;
-}
-
-static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
-                                 const char *username, int *uid) {
-  // Check whether the administrator decided to override the default location
-  // for the secret file.
-  const char *spec = params->secret_filename_spec
-    ? params->secret_filename_spec : SECRET;
-
-  // Obtain the user's id and home directory
-  struct passwd pwbuf, *pw = NULL;
-  char *buf = NULL;
-  char *secret_filename = NULL;
-  if (!params->fixed_uid) {
-    #ifdef _SC_GETPW_R_SIZE_MAX
-    int len = sysconf(_SC_GETPW_R_SIZE_MAX);
-    if (len <= 0) {
-      len = 4096;
-    }
-    #else
-    int len = 4096;
-    #endif
-    buf = malloc(len);
-    *uid = -1;
-    if (buf == NULL ||
-        getpwnam_r(username, &pwbuf, buf, len, &pw) ||
-        !pw ||
-        !pw->pw_dir ||
-        *pw->pw_dir != '/') {
-    err:
-      log_message(LOG_ERR, pamh, "Failed to compute location of secret file");
-      free(buf);
-      free(secret_filename);
-      return NULL;
-    }
-  }
-
-  // Expand filename specification to an actual filename.
-  if ((secret_filename = strdup(spec)) == NULL) {
-    goto err;
-  }
-  int allow_tilde = 1;
-  for (int offset = 0; secret_filename[offset];) {
-    char *cur = secret_filename + offset;
-    char *var = NULL;
-    size_t var_len = 0;
-    const char *subst = NULL;
-    if (allow_tilde && *cur == '~') {
-      var_len = 1;
-      if (!pw) {
-        goto err;
-      }
-      subst = pw->pw_dir;
-      var = cur;
-    } else if (secret_filename[offset] == '$') {
-      if (!memcmp(cur, "${HOME}", 7)) {
-        var_len = 7;
-        if (!pw) {
-          goto err;
-        }
-        subst = pw->pw_dir;
-        var = cur;
-      } else if (!memcmp(cur, "${USER}", 7)) {
-        var_len = 7;
-        subst = username;
-        var = cur;
-      }
-    }
-    if (var) {
-      size_t subst_len = strlen(subst);
-      char *resized = realloc(secret_filename,
-                              strlen(secret_filename) + subst_len);
-      if (!resized) {
-        goto err;
-      }
-      var += resized - secret_filename;
-      secret_filename = resized;
-      memmove(var + subst_len, var + var_len, strlen(var + var_len) + 1);
-      memmove(var, subst, subst_len);
-      offset = var + subst_len - resized;
-      allow_tilde = 0;
-    } else {
-      allow_tilde = *cur == '/';
-      ++offset;
-    }
-  }
-
-  *uid = params->fixed_uid ? params->uid : pw->pw_uid;
-  free(buf);
-  return secret_filename;
 }
 
 static int setuser(int uid) {
@@ -260,7 +174,7 @@ static int setgroup(int gid) {
   return old_gid;
 }
 
-static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
+static int drop_privileges(logger *log, const char *username, int uid,
                            int *old_uid, int *old_gid) {
   // Try to become the new user. This might be necessary for NFS mounted home
   // directories.
@@ -276,12 +190,12 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
   #endif
   char *buf = malloc(len);
   if (!buf) {
-    log_message(LOG_ERR, pamh, "Out of memory");
+    (*log)(LOG_ERR, "Out of memory");
     return -1;
   }
   struct passwd pwbuf, *pw;
   if (getpwuid_r(uid, &pwbuf, buf, len, &pw) || !pw) {
-    log_message(LOG_ERR, pamh, "Cannot look up user id %d", uid);
+    (*log)(LOG_ERR, "Cannot look up user id %d", uid);
     free(buf);
     return -1;
   }
@@ -297,7 +211,7 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
         *old_gid = gid_o;
       }
     }
-    log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"",
+    (*log)(LOG_ERR, "Failed to change user id to \"%s\"",
                 username);
     return -1;
   }
@@ -311,8 +225,7 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
       // Inform the caller that we were unsuccessful in resetting the uid.
       *old_uid = uid_o;
     }
-    log_message(LOG_ERR, pamh,
-                "Failed to change group id for user \"%s\" to %d", username,
+    (*log)(LOG_ERR, "Failed to change group id for user \"%s\" to %d", username,
                 (int)gid);
     return -1;
   }
@@ -322,103 +235,18 @@ static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
   return 0;
 }
 
-static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
-                            struct Params *params, const char *username,
-                            int uid, off_t *size, time_t *mtime) {
-  // Try to open "~/.google_authenticator"
-  *size = 0;
-  *mtime = 0;
-  int fd = open(secret_filename, O_RDONLY);
-  struct stat sb;
-  if (fd < 0 ||
-      fstat(fd, &sb) < 0) {
-    if (params->nullok != NULLERR && errno == ENOENT) {
-      // The user doesn't have a state file, but the admininistrator said
-      // that this is OK. We still return an error from open_secret_file(),
-      // but we remember that this was the result of a missing state file.
-      params->nullok = SECRETNOTFOUND;
-    } else {
-      log_message(LOG_ERR, pamh, "Failed to read \"%s\"", secret_filename);
-    }
- error:
-    if (fd >= 0) {
-      close(fd);
-    }
-    return -1;
-  }
-
-  // Check permissions on "~/.google_authenticator"
-  if ((sb.st_mode & 03577) != 0400 ||
-      !S_ISREG(sb.st_mode) ||
-      sb.st_uid != (uid_t)uid) {
-    char buf[80];
-    if (params->fixed_uid) {
-      sprintf(buf, "user id %d", params->uid);
-      username = buf;
-    }
-    log_message(LOG_ERR, pamh,
-                "Secret file \"%s\" must only be accessible by %s",
-                secret_filename, username);
-    goto error;
-  }
-
-  // Sanity check for file length
-  if (sb.st_size < 1 || sb.st_size > 64*1024) {
-    log_message(LOG_ERR, pamh,
-                "Invalid file size for \"%s\"", secret_filename);
-    goto error;
-  }
-
-  *size = sb.st_size;
-  *mtime = sb.st_mtime;
-  return fd;
-}
-
-static char *read_file_contents(pam_handle_t *pamh,
-                                const char *secret_filename, int *fd,
-                                off_t filesize) {
-  // Read file contents
-  char *buf = malloc(filesize + 1);
-  if (!buf ||
-      read(*fd, buf, filesize) != filesize) {
-    close(*fd);
-    *fd = -1;
-    log_message(LOG_ERR, pamh, "Could not read \"%s\"", secret_filename);
- error:
-    if (buf) {
-      memset(buf, 0, filesize);
-      free(buf);
-    }
-    return NULL;
-  }
-  close(*fd);
-  *fd = -1;
-
-  // The rest of the code assumes that there are no NUL bytes in the file.
-  if (memchr(buf, 0, filesize)) {
-    log_message(LOG_ERR, pamh, "Invalid file contents in \"%s\"",
-                secret_filename);
-    goto error;
-  }
-
-  // Terminate the buffer with a NUL byte.
-  buf[filesize] = '\000';
-
-  return buf;
-}
-
 static int is_totp(const char *buf) {
   return !!strstr(buf, "\" TOTP_AUTH");
 }
 
-static int write_file_contents(pam_handle_t *pamh, const char *secret_filename,
+static int write_file_contents(logger *log, const char *secret_filename,
                                off_t old_size, time_t old_mtime,
                                const char *buf) {
   // Safely overwrite the old secret file.
   char *tmp_filename = malloc(strlen(secret_filename) + 2);
   if (tmp_filename == NULL) {
  removal_failure:
-    log_message(LOG_ERR, pamh, "Failed to update secret file \"%s\"",
+    (*log)(LOG_ERR, "Failed to update secret file \"%s\"",
                 secret_filename);
     return -1;
   }
@@ -437,7 +265,7 @@ static int write_file_contents(pam_handle_t *pamh, const char *secret_filename,
   if (stat(secret_filename, &sb) != 0 ||
       sb.st_size != old_size ||
       sb.st_mtime != old_mtime) {
-    log_message(LOG_ERR, pamh,
+    (*log)(LOG_ERR,
                 "Secret file \"%s\" changed while trying to use "
                 "scratch code\n", secret_filename);
     unlink(tmp_filename);
@@ -461,56 +289,11 @@ static int write_file_contents(pam_handle_t *pamh, const char *secret_filename,
   return 0;
 }
 
-static uint8_t *get_shared_secret(pam_handle_t *pamh,
-                                  const char *secret_filename,
-                                  const char *buf, int *secretLen) {
-  // Decode secret key
-  int base32Len = strcspn(buf, "\n");
-  *secretLen = (base32Len*5 + 7)/8;
-  uint8_t *secret = malloc(base32Len + 1);
-  if (secret == NULL) {
-    *secretLen = 0;
-    return NULL;
-  }
-  memcpy(secret, buf, base32Len);
-  secret[base32Len] = '\000';
-  if ((*secretLen = base32_decode(secret, secret, base32Len)) < 1) {
-    log_message(LOG_ERR, pamh,
-                "Could not find a valid BASE32 encoded secret in \"%s\"",
-                secret_filename);
-    memset(secret, 0, base32Len);
-    free(secret);
-    return NULL;
-  }
-  memset(secret + *secretLen, 0, base32Len + 1 - *secretLen);
-  return secret;
-}
-
-#ifdef TESTING
-static time_t current_time;
-void set_time(time_t t) __attribute__((visibility("default")));
-void set_time(time_t t) {
-  current_time = t;
-}
-
-static time_t get_time(void) {
-  return current_time;
-}
-#else
-static time_t get_time(void) {
-  return time(NULL);
-}
-#endif
-
-static int get_timestamp(void) {
-  return get_time()/30;
-}
-
 static int comparator(const void *a, const void *b) {
   return *(unsigned int *)a - *(unsigned int *)b;
 }
 
-static char *get_cfg_value(pam_handle_t *pamh, const char *key,
+static char *get_cfg_value(logger *log, const char *key,
                            const char *buf) {
   size_t key_len = strlen(key);
   for (const char *line = buf; *line; ) {
@@ -522,7 +305,7 @@ static char *get_cfg_value(pam_handle_t *pamh, const char *key,
       size_t val_len = strcspn(ptr, "\r\n");
       char *val = malloc(val_len + 1);
       if (!val) {
-        log_message(LOG_ERR, pamh, "Out of memory");
+        (*log)(LOG_ERR, "Out of memory");
         return &oom;
       } else {
         memcpy(val, ptr, val_len);
@@ -537,7 +320,7 @@ static char *get_cfg_value(pam_handle_t *pamh, const char *key,
   return NULL;
 }
 
-static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
+static int set_cfg_value(logger *log, const char *key, const char *val,
                          char **buf) {
   size_t key_len = strlen(key);
   char *start = NULL;
@@ -582,7 +365,7 @@ static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
     size_t tail_len = buf_len - (stop - *buf);
     char *resized = malloc(buf_len - (stop - start) + total_len + 1);
     if (!resized) {
-      log_message(LOG_ERR, pamh, "Out of memory");
+      (*log)(LOG_ERR, "Out of memory");
       return -1;
     }
     memcpy(resized, *buf, start - *buf);
@@ -623,8 +406,8 @@ static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
   return 0;
 }
 
-static long get_hotp_counter(pam_handle_t *pamh, const char *buf) {
-  const char *counter_str = get_cfg_value(pamh, "HOTP_COUNTER", buf);
+static long get_hotp_counter(logger *log, const char *buf) {
+  const char *counter_str = get_cfg_value(log, "HOTP_COUNTER", buf);
   if (counter_str == &oom) {
     // Out of memory. This is a fatal error
     return -1;
@@ -639,9 +422,9 @@ static long get_hotp_counter(pam_handle_t *pamh, const char *buf) {
   return counter;
 }
 
-static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
+static int rate_limit(logger *log, const char *secret_filename,
                       int *updated, char **buf) {
-  const char *value = get_cfg_value(pamh, "RATE_LIMIT", *buf);
+  const char *value = get_cfg_value(log, "RATE_LIMIT", *buf);
   if (!value) {
     // Rate limiting is not enabled for this account
     return 0;
@@ -665,7 +448,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
       interval > 3600 ||
       errno) {
     free((void *)value);
-    log_message(LOG_ERR, pamh, "Invalid RATE_LIMIT option. Check \"%s\".",
+    (*log)(LOG_ERR, "Invalid RATE_LIMIT option. Check \"%s\".",
                 secret_filename);
     return -1;
   }
@@ -676,7 +459,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
   if (!timestamps) {
   oom:
     free((void *)value);
-    log_message(LOG_ERR, pamh, "Out of memory");
+    (*log)(LOG_ERR, "Out of memory");
     return -1;
   }
   timestamps[0] = now;
@@ -690,7 +473,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
         ptr == endptr) {
       free((void *)value);
       free(timestamps);
-      log_message(LOG_ERR, pamh, "Invalid list of timestamps in RATE_LIMIT. "
+      (*log)(LOG_ERR, "Invalid list of timestamps in RATE_LIMIT. "
                   "Check \"%s\".", secret_filename);
       return -1;
     }
@@ -741,7 +524,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
   free(timestamps);
 
   // Try to update RATE_LIMIT line.
-  if (set_cfg_value(pamh, "RATE_LIMIT", list, buf) < 0) {
+  if (set_cfg_value(log, "RATE_LIMIT", list, buf) < 0) {
     free(list);
     return -1;
   }
@@ -752,8 +535,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
 
   // If necessary, notify the user of the rate limiting that is in effect.
   if (exceeded) {
-    log_message(LOG_ERR, pamh,
-                "Too many concurrent login attempts. Please try again.");
+    (*log)(LOG_ERR, "Too many concurrent login attempts. Please try again.");
     return -1;
   }
 
@@ -769,7 +551,7 @@ static char *get_first_pass(pam_handle_t *pamh) {
   return NULL;
 }
 
-static char *request_pass(pam_handle_t *pamh, int echocode,
+static char *request_pass(pam_handle_t *pamh, logger *log, int echocode,
                           const char *prompt) {
   // Query user for verification code
   const struct pam_message msg = { .msg_style = echocode,
@@ -780,7 +562,7 @@ static char *request_pass(pam_handle_t *pamh, int echocode,
   char *ret = NULL;
   if (retval != PAM_SUCCESS || resp == NULL || resp->resp == NULL ||
       *resp->resp == '\000') {
-    log_message(LOG_ERR, pamh, "Did not receive verification code from user");
+    (*log)(LOG_ERR, "Did not receive verification code from user");
   } else {
     ret = resp->resp;
   }
@@ -856,9 +638,9 @@ static int check_scratch_codes(pam_handle_t *pamh, const char *secret_filename,
   return 1;
 }
 
-static int window_size(pam_handle_t *pamh, const char *secret_filename,
+static int window_size(logger *log, const char *secret_filename,
                        const char *buf) {
-  const char *value = get_cfg_value(pamh, "WINDOW_SIZE", buf);
+  const char *value = get_cfg_value(log, "WINDOW_SIZE", buf);
   if (!value) {
     // Default window size is 3. This gives us one 30s window before and
     // after the current one.
@@ -877,7 +659,7 @@ static int window_size(pam_handle_t *pamh, const char *secret_filename,
        *endptr != '\n' && *endptr != '\r') ||
       window < 1 || window > 100) {
     free((void *)value);
-    log_message(LOG_ERR, pamh, "Invalid WINDOW_SIZE option in \"%s\"",
+    (*log)(LOG_ERR, "Invalid WINDOW_SIZE option in \"%s\"",
                 secret_filename);
     return 0;
   }
@@ -890,10 +672,10 @@ static int window_size(pam_handle_t *pamh, const char *secret_filename,
  *
  * Returns -1 on error, and 0 on success.
  */
-static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
+static int invalidate_timebased_code(int tm, logger *log,
                                      const char *secret_filename,
                                      int *updated, char **buf) {
-  char *disallow = get_cfg_value(pamh, "DISALLOW_REUSE", *buf);
+  char *disallow = get_cfg_value(log, "DISALLOW_REUSE", *buf);
   if (!disallow) {
     // Reuse of tokens is not explicitly disallowed. Allow the login request
     // to proceed.
@@ -904,7 +686,7 @@ static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
   }
 
   // Allow the user to customize the window size parameter.
-  int window = window_size(pamh, secret_filename, *buf);
+  int window = window_size(log, secret_filename, *buf);
   if (!window) {
     // The user configured a non-standard window size, but there was some
     // error with the value of this parameter.
@@ -938,7 +720,7 @@ static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
     if (tm == blocked) {
       // The code is currently blocked from use. Disallow login.
       free((void *)disallow);
-      log_message(LOG_ERR, pamh,
+      (*log)(LOG_ERR,
                   "Trying to reuse a previously used time-based code. "
                   "Retry again in 30 seconds. "
                   "Warning! This might mean, you are currently subject to a "
@@ -960,14 +742,14 @@ static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
   char *resized = realloc(disallow, strlen(disallow) + 40);
   if (!resized) {
     free((void *)disallow);
-    log_message(LOG_ERR, pamh,
+    (*log)(LOG_ERR,
                 "Failed to allocate memory when updating \"%s\"",
                 secret_filename);
     return -1;
   }
   disallow = resized;
   sprintf(strrchr(disallow, '\000'), " %d" + !*disallow, tm);
-  if (set_cfg_value(pamh, "DISALLOW_REUSE", disallow, buf) < 0) {
+  if (set_cfg_value(log, "DISALLOW_REUSE", disallow, buf) < 0) {
     free((void *)disallow);
     return -1;
   }
@@ -980,44 +762,15 @@ static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
   return 0;
 }
 
-/* Given an input value, this function computes the hash code that forms the
- * expected authentication token.
- */
-#ifdef TESTING
-int compute_code(const uint8_t *secret, int secretLen, unsigned long value)
-  __attribute__((visibility("default")));
-#else
-static
-#endif
-int compute_code(const uint8_t *secret, int secretLen, unsigned long value) {
-  uint8_t val[8];
-  for (int i = 8; i--; value >>= 8) {
-    val[i] = value;
-  }
-  uint8_t hash[SHA1_DIGEST_LENGTH];
-  hmac_sha1(secret, secretLen, val, 8, hash, SHA1_DIGEST_LENGTH);
-  memset(val, 0, sizeof(val));
-  int offset = hash[SHA1_DIGEST_LENGTH - 1] & 0xF;
-  unsigned int truncatedHash = 0;
-  for (int i = 0; i < 4; ++i) {
-    truncatedHash <<= 8;
-    truncatedHash  |= hash[offset + i];
-  }
-  memset(hash, 0, sizeof(hash));
-  truncatedHash &= 0x7FFFFFFF;
-  truncatedHash %= 1000000;
-  return truncatedHash;
-}
-
 /* If a user repeated attempts to log in with the same time skew, remember
  * this skew factor for future login attempts.
  */
-static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
+static int check_time_skew(logger *log, const char *secret_filename,
                            int *updated, char **buf, int skew, int tm) {
   int rc = -1;
 
   // Parse current RESETTING_TIME_SKEW line, if any.
-  char *resetting = get_cfg_value(pamh, "RESETTING_TIME_SKEW", *buf);
+  char *resetting = get_cfg_value(log, "RESETTING_TIME_SKEW", *buf);
   if (resetting == &oom) {
     // Out of memory. This is a fatal error.
     return -1;
@@ -1112,7 +865,7 @@ static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
     // attempts.
     char time_skew[40];
     sprintf(time_skew, "%d", avg_skew);
-    if (set_cfg_value(pamh, "TIME_SKEW", time_skew, buf) < 0) {
+    if (set_cfg_value(log, "TIME_SKEW", time_skew, buf) < 0) {
       return -1;
     }
     rc = 0;
@@ -1128,7 +881,7 @@ static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
       sprintf(strrchr(reset, '\000'), " %d%+d" + !*reset, tms[i], skews[i]);
     }
   }
-  if (set_cfg_value(pamh, "RESETTING_TIME_SKEW", reset, buf) < 0) {
+  if (set_cfg_value(log, "RESETTING_TIME_SKEW", reset, buf) < 0) {
     return -1;
   }
 
@@ -1142,7 +895,7 @@ static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
  * and 1, if no time based code had been entered, and subsequent tests should
  * be applied.
  */
-static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
+static int check_timebased_code(logger *log, const char*secret_filename,
                                 int *updated, char **buf, const uint8_t*secret,
                                 int secretLen, int code, Params *params) {
   if (!is_totp(*buf)) {
@@ -1159,7 +912,7 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
 
   // Compute verification codes and compare them with user input
   const int tm = get_timestamp();
-  const char *skew_str = get_cfg_value(pamh, "TIME_SKEW", *buf);
+  const char *skew_str = get_cfg_value(log, "TIME_SKEW", *buf);
   if (skew_str == &oom) {
     // Out of memory. This is a fatal error
     return -1;
@@ -1171,14 +924,14 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
   }
   free((void *)skew_str);
 
-  int window = window_size(pamh, secret_filename, *buf);
+  int window = window_size(log, secret_filename, *buf);
   if (!window) {
     return -1;
   }
   for (int i = -((window-1)/2); i <= window/2; ++i) {
     unsigned int hash = compute_code(secret, secretLen, tm + skew + i);
     if (hash == (unsigned int)code) {
-      return invalidate_timebased_code(tm + skew + i, pamh, secret_filename,
+      return invalidate_timebased_code(tm + skew + i, log, secret_filename,
                                        updated, buf);
     }
   }
@@ -1201,7 +954,7 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
       }
     }
     if (skew != 1000000) {
-      return check_time_skew(pamh, secret_filename, updated, buf, skew, tm);
+      return check_time_skew(log, secret_filename, updated, buf, skew, tm);
     }
   }
 
@@ -1212,7 +965,7 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
  * success, and 1, if no counter based code had been entered, and subsequent
  * tests should be applied.
  */
-static int check_counterbased_code(pam_handle_t *pamh,
+static int check_counterbased_code(logger *log,
                                    const char*secret_filename, int *updated,
                                    char **buf, const uint8_t*secret,
                                    int secretLen, int code, Params *params,
@@ -1232,7 +985,7 @@ static int check_counterbased_code(pam_handle_t *pamh,
 
   // Compute [window_size] verification codes and compare them with user input.
   // Future codes are allowed in case the user computed but did not use a code.
-  int window = window_size(pamh, secret_filename, *buf);
+  int window = window_size(log, secret_filename, *buf);
   if (!window) {
     return -1;
   }
@@ -1241,7 +994,7 @@ static int check_counterbased_code(pam_handle_t *pamh,
     if (hash == (unsigned int)code) {
       char counter_str[40];
       sprintf(counter_str, "%ld", hotp_counter + i + 1);
-      if (set_cfg_value(pamh, "HOTP_COUNTER", counter_str, buf) < 0) {
+      if (set_cfg_value(log, "HOTP_COUNTER", counter_str, buf) < 0) {
         return -1;
       }
       *updated = 1;
@@ -1254,7 +1007,7 @@ static int check_counterbased_code(pam_handle_t *pamh,
   return 1;
 }
 
-static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid) {
+static int parse_user(logger *log, const char *name, uid_t *uid) {
   char *endptr;
   errno = 0;
   long l = strtol(name, &endptr, 10);
@@ -1272,13 +1025,13 @@ static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid) {
   #endif
   char *buf = malloc(len);
   if (!buf) {
-    log_message(LOG_ERR, pamh, "Out of memory");
+    (*log)(LOG_ERR, "Out of memory");
     return -1;
   }
   struct passwd pwbuf, *pw;
   if (getpwnam_r(name, &pwbuf, buf, len, &pw) || !pw) {
     free(buf);
-    log_message(LOG_ERR, pamh, "Failed to look up user \"%s\"", name);
+    (*log)(LOG_ERR, "Failed to look up user \"%s\"", name);
     return -1;
   }
   *uid = pw->pw_uid;
@@ -1286,7 +1039,7 @@ static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid) {
   return 0;
 }
 
-static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
+static int parse_args(logger *log, int argc, const char **argv,
                       Params *params) {
   params->echocode = PAM_PROMPT_ECHO_OFF;
   for (int i = 0; i < argc; ++i) {
@@ -1295,7 +1048,7 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
       params->secret_filename_spec = argv[i] + 7;
     } else if (!memcmp(argv[i], "user=", 5)) {
       uid_t uid;
-      if (parse_user(pamh, argv[i] + 5, &uid) < 0) {
+      if (parse_user(log, argv[i] + 5, &uid) < 0) {
         return -1;
       }
       params->fixed_uid = 1;
@@ -1314,7 +1067,7 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
                !strcmp(argv[i], "echo_verification_code")) {
       params->echocode = PAM_PROMPT_ECHO_ON;
     } else {
-      log_message(LOG_ERR, pamh, "Unrecognized option \"%s\"", argv[i]);
+      (*log)(LOG_ERR, "Unrecognized option \"%s\"", argv[i]);
       return -1;
     }
   }
@@ -1333,27 +1086,29 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   uint8_t    *secret = NULL;
   int        secretLen = 0;
 
+  logger pam_logger = pam_logger_wrapper(pamh);
+
 #if defined(DEMO) || defined(TESTING)
   *error_msg = '\000';
 #endif
 
   // Handle optional arguments that configure our PAM module
   Params params = { 0 };
-  if (parse_args(pamh, argc, argv, &params) < 0) {
+  if (parse_args(&pam_logger, argc, argv, &params) < 0) {
     return rc;
   }
 
   // Read and process status file, then ask the user for the verification code.
   int early_updated = 0, updated = 0;
-  if ((username = get_user_name(pamh)) &&
-      (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
-      !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
-      (fd = open_secret_file(pamh, secret_filename, &params, username, uid,
+  if ((username = get_user_name(&pam_logger, pamh)) &&
+      (secret_filename = get_secret_filename(&pam_logger, username, &uid)) &&
+      !drop_privileges(&pam_logger, username, uid, &old_uid, &old_gid) &&
+      (fd = open_secret_file(&pam_logger, secret_filename, &params, username, uid,
                              &filesize, &mtime)) >= 0 &&
-      (buf = read_file_contents(pamh, secret_filename, &fd, filesize)) &&
-      (secret = get_shared_secret(pamh, secret_filename, buf, &secretLen)) &&
-       rate_limit(pamh, secret_filename, &early_updated, &buf) >= 0) {
-    long hotp_counter = get_hotp_counter(pamh, buf);
+      (buf = read_file_contents(&pam_logger, secret_filename, &fd, filesize)) &&
+      (secret = get_shared_secret(&pam_logger, secret_filename, buf, &secretLen)) &&
+       rate_limit(&pam_logger, secret_filename, &early_updated, &buf) >= 0) {
+    long hotp_counter = get_hotp_counter(&pam_logger, buf);
     int must_advance_counter = 0;
     char *pw = NULL, *saved_pw = NULL;
     for (int mode = 0; mode < 4; ++mode) {
@@ -1396,7 +1151,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
             // code or a two digit password immediately followed by a six
             // digit verification code. We have to loop and try both
             // options.
-            saved_pw = request_pass(pamh, params.echocode,
+            saved_pw = request_pass(pamh, &pam_logger, params.echocode,
                                     params.forward_pass ?
                                     "Password & verification code: " :
                                     "Verification code: ");
@@ -1450,7 +1205,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
       switch (check_scratch_codes(pamh, secret_filename, &updated, buf, code)){
       case 1:
         if (hotp_counter > 0) {
-          switch (check_counterbased_code(pamh, secret_filename, &updated,
+          switch (check_counterbased_code(&pam_logger, secret_filename, &updated,
                                           &buf, secret, secretLen, code,
                                           &params, hotp_counter,
                                           &must_advance_counter)) {
@@ -1463,7 +1218,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
             break;
           }
         } else {
-          switch (check_timebased_code(pamh, secret_filename, &updated, &buf,
+          switch (check_timebased_code(&pam_logger, secret_filename, &updated, &buf,
                                        secret, secretLen, code, &params)) {
           case 0:
             rc = PAM_SUCCESS;
@@ -1509,7 +1264,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     if (must_advance_counter) {
       char counter_str[40];
       sprintf(counter_str, "%ld", hotp_counter + 1);
-      if (set_cfg_value(pamh, "HOTP_COUNTER", counter_str, &buf) < 0) {
+      if (set_cfg_value(&pam_logger, "HOTP_COUNTER", counter_str, &buf) < 0) {
         rc = PAM_SESSION_ERR;
       }
       updated = 1;
@@ -1517,7 +1272,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
 
     // If nothing matched, display an error message
     if (rc != PAM_SUCCESS) {
-      log_message(LOG_ERR, pamh, "Invalid verification code");
+      pam_logger(LOG_ERR, "Invalid verification code");
     }
   }
 
@@ -1530,7 +1285,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
 
   // Persist the new state.
   if (early_updated || updated) {
-    if (write_file_contents(pamh, secret_filename, filesize,
+    if (write_file_contents(&pam_logger, secret_filename, filesize,
                             mtime, buf) < 0) {
       // Could not persist new state. Deny access.
       rc = PAM_SESSION_ERR;
@@ -1546,7 +1301,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
   if (old_uid >= 0) {
     if (setuser(old_uid) < 0 || setuser(old_uid) != old_uid) {
-      log_message(LOG_EMERG, pamh, "We switched users from %d to %d, "
+      pam_logger(LOG_EMERG, "We switched users from %d to %d, "
                   "but can't switch back", old_uid, uid);
     }
   }
