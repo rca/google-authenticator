@@ -32,6 +32,15 @@ LDL_LDFLAGS := $(shell $(CC) -shared -ldl -xc -o /dev/null /dev/null          \
 all: google-authenticator pam_google_authenticator.so demo                    \
      pam_google_authenticator_unittest
 
+.PHONY: ssh-key-verify
+ssh-key-verify: google-authenticator-verify google-authenticator
+
+.PHONY: install-ssh-key-verify
+install-ssh-key-verify: google-authenticator-verify google-authenticator
+	install -m 0755 google-authenticator-verify /usr/local/bin/google-authenticator-verify
+	install -m 0755 google-ssh-key-authenticator /usr/local/bin/google-ssh-key-authenticator
+	install -m 0755 google-authenticator /usr/local/bin/google-authenticator
+
 google-authenticator-verify: base32.o hmac.o sha1.o libgoogleauthenticator.o google-authenticator-verify.o
 	$(CC) --std=gnu99 -Wall -O2 -fPIC $(DEF_CFLAGS) -o $@ $+
 
