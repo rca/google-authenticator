@@ -69,7 +69,7 @@ clean:
 	               pam_google_authenticator_unittest                      \
 	               libpam-google-authenticator-*-source.tar.bz2
 
-google-authenticator: google-authenticator.o base32.o hmac.o sha1.o
+google-authenticator: google-authenticator.o base32.o hmac.o sha1.o libgoogleauthenticator.o
 	$(CC) -g $(DEF_LDFLAGS) -o $@ $+ $(LDL_LDFLAGS)
 
 demo: demo.o pam_google_authenticator_demo.o base32.o hmac.o sha1.o
