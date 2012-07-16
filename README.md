@@ -21,6 +21,8 @@ would like to protect:
 
 ```command="/usr/local/bin/google-ssh-key-authenticator" ```
 
+This will cache the verification per IP address for 9 hours, meaning once you have successfully entered a secret, you will not have to from that location for another 9 hours.
+
 Notes
 -----
 
