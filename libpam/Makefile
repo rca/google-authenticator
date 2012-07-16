@@ -19,7 +19,7 @@ VERSION := 1.0
 .SUFFIXES: .so
 
 ifeq ($(origin CC), default)
-  CC := gcc
+  CC := gcc -fnested-functions
 endif
 
 DEF_CFLAGS := $(shell [ `uname` = SunOS ] &&                                  \
