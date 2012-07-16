@@ -32,6 +32,9 @@ LDL_LDFLAGS := $(shell $(CC) -shared -ldl -xc -o /dev/null /dev/null          \
 all: google-authenticator pam_google_authenticator.so demo                    \
      pam_google_authenticator_unittest
 
+google-authenticator-verify: base32.o hmac.o sha1.o libgoogleauthenticator.o google-authenticator-verify.o
+	$(CC) --std=gnu99 -Wall -O2 -fPIC $(DEF_CFLAGS) -o $@ $+
+
 test: pam_google_authenticator_unittest
 	./pam_google_authenticator_unittest
 
