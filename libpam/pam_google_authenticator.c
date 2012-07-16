@@ -16,7 +16,6 @@
 // limitations under the License.
 
 #define _GNU_SOURCE
-#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pwd.h>
@@ -76,8 +75,6 @@ logger pam_logger_wrapper(pam_handle_t *pamh) {
 
     return &pam_logger;
 }
-
-static char oom;
 
 #if defined(DEMO) || defined(TESTING)
 static char error_msg[128];
@@ -233,10 +230,6 @@ static int drop_privileges(logger *log, const char *username, int uid,
   *old_uid = uid_o;
   *old_gid = gid_o;
   return 0;
-}
-
-static int comparator(const void *a, const void *b) {
-  return *(unsigned int *)a - *(unsigned int *)b;
 }
 
 static char *get_first_pass(pam_handle_t *pamh) {

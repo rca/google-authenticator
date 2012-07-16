@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <pwd.h>
@@ -17,6 +18,8 @@
 
 #define SECRET      "~/.google_authenticator"
 
+char oom;
+
 typedef struct Params {
   const char *secret_filename_spec;
   enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
@@ -29,6 +32,8 @@ typedef struct Params {
 } Params;
 
 typedef int (*logger)(int level, char *message, ...);
+
+int comparator(const void *a, const void *b);
 
 int compute_code(const uint8_t *secret, int secretLen, unsigned long value);
 

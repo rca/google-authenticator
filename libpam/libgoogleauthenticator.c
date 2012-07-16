@@ -1,5 +1,9 @@
 #include "libgoogleauthenticator.h"
 
+int comparator(const void *a, const void *b) {
+  return *(unsigned int *)a - *(unsigned int *)b;
+}
+
 /* Given an input value, this function computes the hash code that forms the
  * expected authentication token.
  */
@@ -913,7 +917,6 @@ int open_secret_file(logger *log, const char *secret_filename, Params *params,
   if ((sb.st_mode & 03577) != 0400 ||
       !S_ISREG(sb.st_mode) ||
       sb.st_uid != (uid_t)uid) {
-    char buf[80];
     (*log)(LOG_ERR,
                 "Secret file \"%s\" must only be accessible by %s",
                 secret_filename, username);
