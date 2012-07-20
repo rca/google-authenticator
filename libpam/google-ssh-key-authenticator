@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -68,7 +69,7 @@ def launch_command():
         command = os.environ['SHELL']
         args = (command, '-l')
     else:
-        args = command.split()
+        args = shlex.split(command)
         command = args[0]
 
     # replace the existing process with the original command.
